@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
@@ -7,12 +5,17 @@ use rug::Float;
 use threadpool::ThreadPool;
 
 use glium::{
-    glutin::{self, ElementState, Event, MouseButton, WindowEvent},
-    Display, Surface,
+    glutin::{
+        self,
+        event::{ElementState, Event, ModifiersState, MouseButton, MouseScrollDelta, WindowEvent},
+        event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget},
+    },
+    Surface,
 };
-use imgui::{Condition, Context, FontConfig, FontGlyphRanges, FontSource, Ui};
-use imgui_glium_renderer::Renderer;
+use imgui::{Condition, Context, FontConfig, FontGlyphRanges, FontSource};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
+
+use num_traits::{FromPrimitive, ToPrimitive};
 
 use crate::mandelbrot::{
     bounded::BoundsSettings,
@@ -34,7 +37,7 @@ impl AppSettings {
         AppSettings {
             precision: 53,
             resolution: [1600, 900],
-            iterations: 500,
+            iterations: 1000,
             engine: ComputeEngine::SimdF64x4,
         }
     }
@@ -71,17 +74,42 @@ impl ZoomState {
 
     fn set_by_dragging(&mut self, start: [f64; 2], end: [f64; 2], settings: &AppSettings) {
         let scale_xy = [(start[0] - end[0]).abs(), (start[1] - end[1]).abs()];
-        let ratio = f64::from(settings.resolution[0]) / f64::from(settings.resolution[1]);
+        let ratio = Float::with_val(settings.precision, settings.resolution[0])
+            / f64::from(settings.resolution[1]);
         let scale = Float::with_val(settings.precision, scale_xy[1]) * &self.scale;
         let pos = [
-            &self.pos[0] + Float::with_val(settings.precision, (start[0] + end[0]) - 1.0) / 2.0
-                    * &self.scale
-                    * ratio,
-            &self.pos[1] - Float::with_val(settings.precision, (start[1] + end[1]) - 1.0) / 2.0
-                    * &self.scale,
+            &self.pos[0]
+                + Float::with_val(
+                    settings.precision,
+                    ((start[0] + end[0]) - 1.0) / 2.0 * self.scale.clone() * ratio,
+                ),
+            &self.pos[1]
+                - Float::with_val(
+                    settings.precision,
+                    ((start[1] + end[1]) - 1.0) / 2.0 * self.scale.clone(),
+                ),
         ];
         self.pos = pos;
         self.scale = scale;
+    }
+
+    fn zoom_position(&mut self, pos: [f64; 2], scale: f64, settings: &AppSettings) {
+        self.scale *= scale;
+        let ratio = Float::with_val(settings.precision, settings.resolution[0])
+            / f64::from(settings.resolution[1]);
+        let pos = [
+            &self.pos[0]
+                + Float::with_val(
+                    settings.precision,
+                    (pos[0] - 0.5) * self.scale.clone() * ratio,
+                ),
+            &self.pos[1] - Float::with_val(settings.precision, (pos[1] - 0.5) * self.scale.clone()),
+        ];
+        self.pos = pos;
+    }
+
+    fn zoom_scale(&mut self, scale: f64) {
+        self.scale *= scale
     }
 }
 
@@ -94,9 +122,13 @@ pub struct AppState {
     pub dragging: bool,
     pub mouse_start: [f64; 2],
     pub mouse_end: [f64; 2],
+    pub modifiers: ModifiersState,
     pub zoomstate: ZoomState,
     pub compute_valid: bool,
     pub compute_busy: bool,
+
+    pub compute_start: Option<std::time::Instant>,
+    pub compute_time: Option<std::time::Duration>,
 }
 
 impl AppState {
@@ -110,45 +142,41 @@ impl AppState {
             dragging: false,
             mouse_start: [0.0, 0.0],
             mouse_end: [0.0, 0.0],
+            modifiers: ModifiersState::empty(),
             zoomstate: ZoomState::new(settings),
             compute_valid: false,
             compute_busy: false,
+
+            compute_start: None,
+            compute_time: None,
         }
     }
 }
 
 pub struct App {
-    events_loop: Rc<RefCell<glutin::EventsLoop>>,
-    display: Rc<RefCell<glium::Display>>,
-    imgui: Rc<RefCell<Context>>,
-    platform: Rc<RefCell<WinitPlatform>>,
-    imgui_render: Rc<RefCell<Renderer>>,
-    app_render: Rc<RefCell<AppRenderer>>,
+    event_loop: EventLoop<()>,
+    display: glium::Display,
+    imgui: Context,
+    imgui_platform: WinitPlatform,
+    app_render: AppRenderer,
 
-    state: Rc<RefCell<AppState>>,
-    settings: Rc<RefCell<AppSettings>>,
+    state: AppState,
+    settings: AppSettings,
 }
 
 impl App {
     pub fn new(settings: AppSettings) -> App {
-        let events_loop = glutin::EventsLoop::new();
+        let event_loop = EventLoop::new();
         let context = glutin::ContextBuilder::new().with_vsync(true);
-        let builder = glutin::WindowBuilder::new()
+        let builder = glutin::window::WindowBuilder::new()
             .with_title("mandelbrot explorer")
-            .with_dimensions(glutin::dpi::LogicalSize::new(1600f64, 900f64));
-        let display = Display::new(builder, context, &events_loop).unwrap();
+            .with_inner_size(glutin::dpi::LogicalSize::new(1600f64, 900f64));
+        let display = glium::Display::new(builder, context, &event_loop).unwrap();
 
         let mut imgui = Context::create();
         imgui.set_ini_filename(None);
 
-        let mut platform = WinitPlatform::init(&mut imgui);
-        {
-            let gl_window = display.gl_window();
-            let window = gl_window.window();
-            platform.attach_window(imgui.io_mut(), &window, HiDpiMode::Rounded);
-        }
-
-        let hidpi_factor = platform.hidpi_factor();
+        let hidpi_factor = display.gl_window().window().scale_factor();
         let font_size = 13.0 * hidpi_factor as f32;
 
         imgui.fonts().add_font(&[
@@ -170,21 +198,27 @@ impl App {
         ]);
 
         imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+        imgui.io_mut().display_size = [1600f32, 900f32];
 
-        let imgui_render = Renderer::init(&mut imgui, &display).unwrap();
+        let mut platform = WinitPlatform::init(&mut imgui);
+        {
+            let gl_window = display.gl_window();
+            let window = gl_window.window();
+            platform.attach_window(imgui.io_mut(), window, HiDpiMode::Rounded);
+        }
+
         let app_render = AppRenderer::init();
 
         let state = AppState::new(&settings);
 
         App {
-            events_loop: Rc::new(RefCell::new(events_loop)),
-            display: Rc::new(RefCell::new(display)),
-            imgui: Rc::new(RefCell::new(imgui)),
-            platform: Rc::new(RefCell::new(platform)),
-            imgui_render: Rc::new(RefCell::new(imgui_render)),
-            app_render: Rc::new(RefCell::new(app_render)),
-            state: Rc::new(RefCell::new(state)),
-            settings: Rc::new(RefCell::new(settings)),
+            event_loop: event_loop,
+            display: display,
+            imgui: imgui,
+            imgui_platform: platform,
+            app_render: app_render,
+            state: state,
+            settings: settings,
         }
     }
 
@@ -219,52 +253,70 @@ impl App {
         })
     }
 
-    pub fn main_loop<F: FnMut(&mut bool, &mut Ui, &mut AppState, &mut AppSettings)>(
-        &mut self,
-        mut run_ui: F,
-    ) {
+    pub fn run(self) {
         let (tx, rx) = channel();
         let (compute_tx, compute_rx) = channel();
 
-        let display = self.display.borrow();
-        let gl_window = display.gl_window();
-        let window = gl_window.window();
-
-        window.set_maximized(false);
+        self.display.gl_window().window().set_maximized(false);
 
         let mut frame_time = std::time::Instant::now();
-        let mut run = true;
 
-        let events_loop = self.events_loop.clone();
-        let platform = self.platform.clone();
-        let imgui = self.imgui.clone();
-        let state = self.state.clone();
-        let settings = self.settings.clone();
-        let imgui_render = self.imgui_render.clone();
-        let app_render = self.app_render.clone();
+        let App {
+            display,
+            mut state,
+            mut imgui,
+            mut settings,
+            event_loop,
+            mut app_render,
+            mut imgui_platform,
+            ..
+        } = self;
 
-        while run {
-            let mut imgui = imgui.borrow_mut();
-            let mut state = state.borrow_mut();
-            let mut settings = settings.borrow_mut();
-            events_loop.borrow_mut().poll_events(|event| {
-                platform
-                    .borrow_mut()
-                    .handle_event(imgui.io_mut(), &window, &event);
+        let mut renderer = imgui_glium_renderer::Renderer::init(&mut imgui, &display).unwrap();
+
+        event_loop.run(
+            move |event: Event<()>, _target: &EventLoopWindowTarget<()>, flow: &mut ControlFlow| {
+                let gl_window = display.gl_window();
+                imgui_platform.handle_event(imgui.io_mut(), gl_window.window(), &event);
+
                 match event {
+                    Event::NewEvents(_) => {
+                        imgui.io_mut().update_delta_time(frame_time);
+                    }
+                    Event::MainEventsCleared => {
+                        let gl_window = display.gl_window();
+                        imgui_platform
+                            .prepare_frame(imgui.io_mut(), &gl_window.window())
+                            .unwrap();
+                        gl_window.window().request_redraw();
+                    }
+                    Event::RedrawRequested(_) => {
+                        Self::redraw(
+                            &display,
+                            &mut imgui,
+                            &mut frame_time,
+                            &mut app_render,
+                            &mut state,
+                            &mut settings,
+                            &mut renderer,
+                        );
+                    }
                     Event::WindowEvent {
                         event: WindowEvent::CloseRequested,
                         ..
                     } => {
-                        run = false;
+                        *flow = ControlFlow::Exit;
                     }
                     Event::WindowEvent {
                         event: WindowEvent::CursorMoved { position, .. },
                         ..
                     } => {
                         if !imgui.io().want_capture_mouse {
-                            let size = window.get_inner_size().unwrap();
-                            state.mouse_pos = [position.x / size.width, position.y / size.height];
+                            let size = display.gl_window().window().inner_size();
+                            state.mouse_pos = [
+                                position.x / size.width as f64,
+                                position.y / size.height as f64,
+                            ];
                             state.mouse_end = state.mouse_pos;
                         }
                     }
@@ -291,103 +343,164 @@ impl App {
                                         state.dragging = false;
                                         let start = state.mouse_start;
                                         let end = state.mouse_end;
-                                        state.zoomstate.set_by_dragging(start, end, &settings);
+                                        if (end[1] - start[1]) + (end[0] - start[0]) > 0.001 {
+                                            state.zoomstate.set_by_dragging(start, end, &settings);
+                                        } else {
+                                            state.zoomstate.zoom_position(start, {
+                                                if state.modifiers.shift() { 0.7 } else { 1.0 }
+                                            }, &settings);
+                                        }
                                         state.compute_valid = false;
                                     }
                                 }
                             }
                         }
                     }
+                    Event::WindowEvent {
+                        event:
+                            WindowEvent::MouseWheel {
+                                delta: MouseScrollDelta::LineDelta(_delta_x, delta_y),
+                                ..
+                            },
+                        ..
+                    } => {
+                        if !state.compute_busy {
+                            let m = if state.modifiers.shift() { 3.0 } else { 1.5 };
+                            let scale = 1.0 + (m * -delta_y / 10.0) as f64;
+                            if state.modifiers.ctrl() {
+                                state.zoomstate.zoom_scale(scale);
+                            } else {
+                                state.zoomstate.zoom_position(state.mouse_pos, scale, &settings);
+                            }
+                            state.compute_valid = false;
+                        }
+                    }
+                    Event::WindowEvent {
+                        event: WindowEvent::ModifiersChanged(modifiers),
+                        ..
+                    } => {
+                        state.modifiers = modifiers;
+                    }
                     _ => {}
                 }
-            });
-            if !state.compute_valid {
-                App::recompute(&state.zoomstate, &settings, tx.clone(), compute_tx.clone());
-                state.compute_valid = true;
-                state.compute_busy = true;
-            }
 
-            if let Ok(result) = rx.try_recv() {
-                state.computed_set = result;
-                state.set_valid = false;
-                state.compute_busy = false;
-            }
+                if !state.compute_valid {
+                    App::recompute(&state.zoomstate, &settings, tx.clone(), compute_tx.clone());
+                    state.compute_valid = true;
+                    state.compute_busy = true;
+                    state.compute_start = Some(std::time::Instant::now());
+                    state.compute_time = None;
+                }
 
-            for event in compute_rx.try_iter() {
-                state.progress = event;
-            }
+                if let Ok(result) = rx.try_recv() {
+                    state.computed_set = result;
+                    state.set_valid = false;
+                    state.compute_busy = false;
+                    state.compute_time = Some(state.compute_start.unwrap().elapsed());
+                    state.compute_start = None;
+                }
 
-            let io = imgui.io_mut();
-            platform.borrow().prepare_frame(io, &window).unwrap();
-            frame_time = io.update_delta_time(frame_time);
-            let mut ui = imgui.frame();
-            run_ui(&mut run, &mut ui, &mut state, &mut settings);
-            let mut target = display.draw();
-            target.clear_color_srgb(1.0, 1.0, 1.0, 1.0);
-            app_render
-                .borrow_mut()
-                .render(&mut state, &mut target, &(*display));
-            platform.borrow().prepare_render(&ui, &window);
-            //render ui
-            let draw_data = ui.render();
-            // render mandelbrot
-
-            //render imgui ui to glium
-            imgui_render
-                .borrow_mut()
-                .render(&mut target, draw_data)
-                .unwrap();
-            //swap buffers
-            target.finish().unwrap();
-        }
+                for event in compute_rx.try_iter() {
+                    state.progress = event;
+                }
+            },
+        );
     }
 
-    pub fn run(&mut self) {
-        self.main_loop(|_run, ui, state, settings| {
-            ui.window(im_str!("Mandelbrot-explorer"))
-                .size([400.0, 600.0], Condition::FirstUseEver)
-                .build(|| {
-                    ui.text(im_str!(
-                        "Position:\n\tX:{:1}\n\tY:{:1})",
-                        state.zoomstate.get_x(),
-                        state.zoomstate.get_y()
-                    ));
-                    ui.separator();
-                    ui.text(im_str!("Scale:{:1})", state.zoomstate.get_scale()));
-                    ui.separator();
-                    if ui.button(im_str!("Render"), [60.0, 20.0]) && !state.compute_busy {
-                        state.compute_valid = false;
-                    };
-                    ui.separator();
-                    let mut iterations = settings.iterations as i32;
-                    ui.input_int(im_str!("Iterations"), &mut iterations).build();
-                    settings.iterations = iterations as u64;
-                    ui.separator();
-                    let items = [
-                        im_str!("Single"),
-                        im_str!("Double"),
-                        im_str!("Simd f64X4"),
-                        im_str!("MPC"),
-                    ];
-                    let mut select = settings.engine.to_int();
-                    if ui.list_box(im_str!("Engine"), &mut select, &items, items.len() as i32) {
-                        settings.engine = ComputeEngine::from_int(select);
-                    }
-                    ui.separator();
-                    let mut precision = settings.precision as i32;
-                    ui.input_int(im_str!("MPC Precision"), &mut precision)
-                        .build();
-                    settings.precision = precision as u32;
-                    ui.separator();
-                    match state.progress {
-                        ComputeEvent::Progress((a, b)) => {
-                            ui.progress_bar(a as f32 / b as f32).build();
-                        }
-                        _ => {
-                            ui.progress_bar(0f32).build();
-                        }
-                    }
+    fn redraw(
+        display: &glium::Display,
+        imgui: &mut imgui::Context,
+        frame_time: &mut std::time::Instant,
+        app_render: &mut AppRenderer,
+        state: &mut AppState,
+        settings: &mut AppSettings,
+        renderer: &mut imgui_glium_renderer::Renderer,
+    ) {
+        let io = imgui.io_mut();
+        //platform.borrow().prepare_frame(io, &window).unwrap();
+        *frame_time = io.update_delta_time(*frame_time);
+
+        let mut target = display.draw();
+        target.clear_color_srgb(1.0, 1.0, 1.0, 1.0);
+        app_render.render(state, &mut target, display);
+        //platform.borrow().prepare_render(&ui, &window);
+        let ui = imgui.frame();
+        Self::build_ui(&ui, state, settings);
+        //render ui
+        let draw_data = ui.render();
+        // render mandelbrot
+
+        //render imgui ui to glium
+        renderer.render(&mut target, draw_data).unwrap();
+        //swap buffers
+        target.finish().unwrap();
+    }
+
+    fn build_ui(ui: &imgui::Ui, state: &mut AppState, settings: &mut AppSettings) {
+        imgui::Window::new(im_str!("Mandelbrot-explorer"))
+            .size([400.0, 600.0], Condition::FirstUseEver)
+            .build(ui, || {
+                ui.text(im_str!(
+                    "Position:\n\tX:{:.4}\n\tY:{:.4}",
+                    state.zoomstate.get_x(),
+                    state.zoomstate.get_y()
+                ));
+                ui.separator();
+                ui.text(im_str!("Scale:\n\t{:.4}", state.zoomstate.get_scale()));
+                ui.separator();
+                if ui.button(im_str!("Render"), [60.0, 20.0]) && !state.compute_busy {
+                    state.compute_valid = false;
+                };
+                if ui.button(im_str!("Reset"), [60.0, 20.0]) && !state.compute_busy {
+                    state.zoomstate = ZoomState::new(&settings);
+                    state.compute_valid = false;
+                }
+                ui.separator();
+                let mut iterations = settings.iterations as i32;
+                ui.input_int(im_str!("Iterations"), &mut iterations).build();
+                settings.iterations = iterations as u64;
+                ui.separator();
+                let items: Vec<_> = ComputeEngine::LIST
+                    .iter()
+                    .map(|x| im_str!("{:?}", x))
+                    .collect();
+                let mut select: i32 = settings.engine.to_i32().unwrap();
+                if ui.list_box(
+                    im_str!("Engine"),
+                    &mut select,
+                    items.iter().collect::<Vec<_>>().as_slice(),
+                    items.len() as i32,
+                ) {
+                    settings.engine = FromPrimitive::from_i32(select).unwrap()
+                }
+                ui.separator();
+                let mut precision = settings.precision as i32;
+                ui.input_int(im_str!("Precision bits"), &mut precision)
+                    .build();
+                settings.precision = precision as u32;
+                ui.separator();
+                imgui::ProgressBar::new(match state.progress {
+                    ComputeEvent::Progress((a, b)) => a as f32 / b as f32,
+                    _ => 0f32,
                 })
-        });
+                .build(&ui);
+
+                ui.separator();
+                ui.text(im_str!("Render time:"));
+                if let Some(duration) = state.compute_time {
+                    ui.text(im_str!("\t{:.4} seconds", duration.as_secs_f64()));
+                } else {
+                    ui.text(im_str!("\tn/a"));
+                }
+                ui.separator();
+                ui.text(im_str!(r"
+Area drag: zoom in on area
+click: move to position
+shift+click: click zoom in on position
+ctrl+scroll: zoom in on center
+scroll: zoom in and move to position
+hold shift: zoom more
+                "))
+            });
     }
 }

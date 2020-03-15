@@ -1,5 +1,4 @@
 #![feature(test)]
-#![feature(duration_float)]
 
 extern crate test;
 
@@ -42,7 +41,7 @@ fn main() {
                 Float::with_val(precision, 1.75),
                 size.0,
                 size.1,
-                ComputeEngine::MPC,
+                ComputeEngine::Precision,
                 BoundsSettings::new(250, precision),
             );
 
@@ -52,7 +51,7 @@ fn main() {
             println!("{}", duration.as_secs_f64());
         }
         _ => {
-            let mut app = App::new(AppSettings::new());
+            let app = App::new(AppSettings::new());
             app.run();
         }
     }

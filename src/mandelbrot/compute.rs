@@ -1,40 +1,31 @@
 use std::sync::mpsc::{channel, Sender};
 use threadpool::ThreadPool;
 
-use packed_simd::f64x4;
+use packed_simd::{f32x8, f64x4};
 use rug::{Complex, Float};
 
 use crate::mandelbrot::bounded::{Bound, BoundsChecker, BoundsSettings};
 use crate::ui::events::ComputeEvent;
 
-#[allow(dead_code)]
-#[derive(Clone, Copy)]
+use num_derive::{FromPrimitive, ToPrimitive};
+
+#[derive(Clone, Copy, Debug, FromPrimitive, ToPrimitive)]
 pub enum ComputeEngine {
     Single,
     Double,
-    MPC,
+    SimdF32x8,
     SimdF64x4,
+    Precision,
 }
 
 impl ComputeEngine {
-    pub fn to_int(self) -> i32 {
-        match self {
-            Self::Single => 0,
-            Self::Double => 1,
-            Self::SimdF64x4 => 2,
-            Self::MPC => 3,
-        }
-    }
-
-    pub fn from_int(value: i32) -> Self {
-        match value {
-            0 => Self::Single,
-            1 => Self::Double,
-            2 => Self::SimdF64x4,
-            3 => Self::MPC,
-            _ => Self::Double,
-        }
-    }
+    pub const LIST: [Self; 5] = [
+        Self::Single,
+        Self::Double,
+        Self::SimdF32x8,
+        Self::SimdF64x4,
+        Self::Precision,
+    ];
 }
 
 pub struct ComputeSettings {
@@ -133,8 +124,11 @@ impl Compute {
             ComputeEngine::Double => {
                 Self::compute_set_with_engine::<f64>(thread_pool, message, &settings)
             }
-            ComputeEngine::MPC => {
-                Self::compute_set_with_engine::<Complex>(thread_pool, message, &settings)
+            ComputeEngine::Precision => {
+                Self::compute_set_with_engine_hp::<Complex>(thread_pool, message, &settings)
+            }
+            ComputeEngine::SimdF32x8 => {
+                Self::compute_set_with_engine::<f32x8>(thread_pool, message, &settings)
             }
             ComputeEngine::SimdF64x4 => {
                 Self::compute_set_with_engine::<f64x4>(thread_pool, message, &settings)
@@ -142,7 +136,70 @@ impl Compute {
         }
     }
 
-    fn compute_set_with_engine<T: BoundsChecker + 'static>(
+    fn compute_set_with_engine<T: BoundsChecker<f64> + 'static>(
+        thread_pool: Option<&mut ThreadPool>,
+        message: Option<Sender<ComputeEvent>>,
+        settings: &ComputeSettings,
+    ) -> ComputedSet {
+        let ratio = settings.width as f64 / settings.height as f64;
+        let scale = settings.scale.to_f64();
+
+        let x_start = settings.x.to_f64() - ((scale * ratio) / 2.0);
+        let y_start = settings.y.to_f64() - (scale / 2.0);
+        let step = (scale * ratio) / (settings.width as f64);
+
+        if let Some(sender) = &message {
+            sender.send(ComputeEvent::Start).unwrap();
+        }
+
+        let mut output = vec![Bound::Bounded; settings.width as usize * settings.height as usize];
+        match thread_pool {
+            None => {
+                for y in 0..settings.height {
+                    let out = &mut output
+                        [(y * settings.width) as usize..((y + 1) * settings.width) as usize];
+                    Self::compute_row::<T>(y, [x_start, y_start], step, out, &settings);
+                    if let Some(sender) = &message {
+                        sender
+                            .send(ComputeEvent::Progress((y, settings.height)))
+                            .unwrap();
+                    }
+                }
+            }
+            Some(thread_pool) => {
+                let (tx, rx) = channel();
+                for y in 0..settings.height {
+                    let tx = tx.clone();
+                    let settings = settings.clone();
+                    thread_pool.execute(move || {
+                        let mut out = vec![Bound::Bounded; settings.width as usize];
+                        Self::compute_row::<T>(y, [x_start, y_start], step, &mut out, &settings);
+                        tx.send((y, out)).unwrap();
+                    });
+                }
+                for n in 0..settings.height {
+                    let (y, row) = rx.recv().unwrap();
+                    for (input, output) in row
+                        .iter()
+                        .zip(output.iter_mut().skip((y * settings.width) as usize))
+                    {
+                        *output = *input;
+                    }
+                    if let Some(sender) = &message {
+                        sender
+                            .send(ComputeEvent::Progress((n, settings.height)))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        if let Some(sender) = &message {
+            sender.send(ComputeEvent::End).unwrap();
+        }
+        ComputedSet::new(settings.width, settings.height, output)
+    }
+
+    fn compute_set_with_engine_hp<T: BoundsChecker<Float> + 'static>(
         thread_pool: Option<&mut ThreadPool>,
         message: Option<Sender<ComputeEvent>>,
         settings: &ComputeSettings,
@@ -157,12 +214,11 @@ impl Compute {
             precision,
             &settings.x - (Float::with_val(precision, &settings.scale * &ratio) / 2.0),
         );
-        let x_step = Float::with_val(precision, &settings.scale * &ratio) / &w;
         let y_start = Float::with_val(
             precision,
             &settings.y - (Float::with_val(precision, &settings.scale / 2.0)),
         );
-        let y_step = Float::with_val(precision, &settings.scale / &h);
+        let step = Float::with_val(precision, &settings.scale * &ratio) / &w;
 
         if let Some(sender) = &message {
             sender.send(ComputeEvent::Start).unwrap();
@@ -174,13 +230,7 @@ impl Compute {
                 for y in 0..settings.height {
                     let out = &mut output
                         [(y * settings.width) as usize..((y + 1) * settings.width) as usize];
-                    Self::compute_row::<T>(
-                        y,
-                        [&x_start, &y_start],
-                        [&x_step, &y_step],
-                        out,
-                        settings.clone(),
-                    );
+                    Self::compute_row_hp::<T>(y, [&x_start, &y_start], &step, out, &settings);
                     if let Some(sender) = &message {
                         sender
                             .send(ComputeEvent::Progress((y, settings.height)))
@@ -195,16 +245,15 @@ impl Compute {
                     let settings = settings.clone();
                     let x_start = x_start.clone();
                     let y_start = y_start.clone();
-                    let x_step = x_step.clone();
-                    let y_step = y_step.clone();
+                    let step = step.clone();
                     thread_pool.execute(move || {
                         let mut out = vec![Bound::Bounded; settings.width as usize];
-                        Self::compute_row::<T>(
+                        Self::compute_row_hp::<T>(
                             y,
                             [&x_start, &y_start],
-                            [&x_step, &y_step],
+                            &step,
                             &mut out,
-                            settings,
+                            &settings,
                         );
                         tx.send((y, out)).unwrap();
                     });
@@ -231,28 +280,46 @@ impl Compute {
         ComputedSet::new(settings.width, settings.height, output)
     }
 
-    fn compute_row<T: BoundsChecker + 'static>(
+    fn compute_row<T: BoundsChecker<f64> + 'static>(
+        y: u32,
+        start: [f64; 2],
+        step: f64,
+        out: &mut [Bound],
+        settings: &ComputeSettings,
+    ) {
+        let step_by = T::mask().len();
+        let yy = start[1] + step * y as f64;
+        for x in (0..settings.width).step_by(step_by) {
+            let mut xx: Vec<f64> = Vec::with_capacity(step_by);
+            for i in 0..step_by {
+                xx.push(start[0] + step * (x + i as u32) as f64)
+            }
+            let yy = vec![yy; step_by];
+
+            let out = &mut out[x as usize..x as usize + step_by];
+            T::check_bounded(&xx, &yy, &settings.bounds, out);
+        }
+    }
+
+    fn compute_row_hp<T: BoundsChecker<Float> + 'static>(
         y: u32,
         start: [&Float; 2],
-        step: [&Float; 2],
+        step: &Float,
         out: &mut [Bound],
-        settings: ComputeSettings,
+        settings: &ComputeSettings,
     ) {
         let step_by = T::mask().len();
         let precision = settings.bounds.precision;
-        let yy = Float::with_val(
-            precision,
-            start[1] + Float::with_val(precision, step[1] * y),
-        );
+        let yy = Float::with_val(precision, start[1] + Float::with_val(precision, step * y));
         for x in (0..settings.width).step_by(step_by) {
             let mut xx: Vec<Float> = Vec::with_capacity(step_by);
             for i in 0..step_by {
-                xx.push(start[0] + step[0] * Float::with_val(precision, x + i as u32))
+                xx.push(start[0] + step * Float::with_val(precision, x + i as u32))
             }
             let yy = vec![Float::with_val(precision, &yy); step_by];
 
             let out = &mut out[x as usize..x as usize + step_by];
-            T::check_bounded(&xx, &yy, settings.bounds, out);
+            T::check_bounded(&xx, &yy, &settings.bounds, out);
         }
     }
 }

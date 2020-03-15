@@ -226,7 +226,15 @@ where
                 RawImage2d::from_raw_rgba(
                     data.flat_map(|bound| match bound {
                         Bound::Bounded => vec![0.0, 0.0, 0.0, 1.0],
-                        Bound::Unbounded(n) => vec![*n as f32 / 500.0, 0.0, 0.0, 1.0],
+                        Bound::Unbounded(n) => {
+                            let c = palette::Hsv::new(
+                                palette::RgbHue::from_degrees(*n as f32),
+                                1.0,
+                                1.0,
+                            );
+                            let c = palette::LinSrgb::from(c);
+                            vec![c.red, c.green, c.blue, 1.0]
+                        }
                     })
                     .collect::<Vec<f32>>(),
                     self.get_size(),
